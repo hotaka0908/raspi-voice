@@ -228,10 +228,12 @@ def gmail_list(query="is:unread", max_results=5):
             email_info = {
                 'id': msg['id'],
                 'from': from_name,
+                'from_email': from_header,  # 返信用に完全なメールアドレスを保持
                 'subject': headers.get('Subject', '(件名なし)'),
                 'date': headers.get('Date', ''),
             }
             last_email_list.append(email_info)
+            print(f"メール保存: ID={msg['id']}, From={from_header}")  # デバッグログ
             email_list.append(f"{i}. {from_name}さんから: {email_info['subject']}")
 
         return "メール一覧:\n" + "\n".join(email_list)
@@ -307,7 +309,21 @@ def gmail_send(to, subject, body):
         return f"メール送信エラー: {e}"
 
 
-def gmail_reply(message_id, body):
+def extract_email_address(email_str):
+    """メールアドレス部分を抽出（例: '"名前" <test@example.com>' → 'test@example.com'）"""
+    if not email_str:
+        return None
+    # <email@example.com> 形式からメールアドレスを抽出
+    match = re.search(r'<([^>]+)>', email_str)
+    if match:
+        return match.group(1)
+    # @が含まれていればそのまま使用
+    if '@' in email_str:
+        return email_str.strip()
+    return None
+
+
+def gmail_reply(message_id, body, to_email=None):
     """メール返信"""
     global gmail_service
 
@@ -320,13 +336,18 @@ def gmail_reply(message_id, body):
             userId='me',
             id=message_id,
             format='metadata',
-            metadataHeaders=['From', 'Subject', 'Message-ID', 'References']
+            metadataHeaders=['From', 'Subject', 'Message-ID', 'References', 'Reply-To']
         ).execute()
 
         headers = {h['name']: h['value'] for h in original.get('payload', {}).get('headers', [])}
 
-        # 返信先
-        to = headers.get('From', '')
+        # 返信先（Reply-Toがあればそれを使う、なければFrom）
+        to_raw = to_email or headers.get('Reply-To') or headers.get('From', '')
+        to = extract_email_address(to_raw)
+
+        if not to:
+            return "返信先のメールアドレスが取得できませんでした"
+
         subject = headers.get('Subject', '')
         if not subject.startswith('Re:'):
             subject = 'Re: ' + subject
@@ -339,8 +360,9 @@ def gmail_reply(message_id, body):
         message = MIMEText(body)
         message['to'] = to
         message['subject'] = subject
-        message['In-Reply-To'] = message_id_header
-        message['References'] = f"{references} {message_id_header}".strip()
+        if message_id_header:
+            message['In-Reply-To'] = message_id_header
+            message['References'] = f"{references} {message_id_header}".strip()
 
         raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
 
@@ -349,7 +371,11 @@ def gmail_reply(message_id, body):
             body={'raw': raw, 'threadId': thread_id}
         ).execute()
 
-        return "返信を送信しました"
+        # 送信先の名前を抽出
+        to_match = re.match(r'(.+?)\s*<', to)
+        to_name = to_match.group(1).strip() if to_match else to.split('@')[0]
+
+        return f"{to_name}さんに返信を送信しました"
 
     except HttpError as e:
         return f"返信エラー: {e}"
@@ -385,13 +411,17 @@ def execute_tool(tool_call):
         )
     elif tool_name == 'gmail_reply':
         msg_id = params.get('message_id')
+        to_email = None
         if isinstance(msg_id, int) or (isinstance(msg_id, str) and msg_id.isdigit()):
             idx = int(msg_id) - 1
+            print(f"返信処理: idx={idx}, last_email_list長さ={len(last_email_list)}")  # デバッグログ
             if 0 <= idx < len(last_email_list):
                 msg_id = last_email_list[idx]['id']
+                to_email = last_email_list[idx].get('from_email')
+                print(f"返信先: msg_id={msg_id}, to_email={to_email}")  # デバッグログ
             else:
-                return "指定されたメールが見つかりません"
-        return gmail_reply(msg_id, params.get('body'))
+                return "指定されたメールが見つかりません。先に「メールを確認して」と言ってください。"
+        return gmail_reply(msg_id, params.get('body'), to_email)
     else:
         return f"不明なツール: {tool_name}"
 
@@ -589,11 +619,17 @@ def get_ai_response(text):
 
     ai_response = response.choices[0].message.content
 
-    # ツール呼び出しかチェック
+    # ツール呼び出しかチェック（応答内にJSONが含まれているか）
     try:
-        # JSON形式のツール呼び出しを検出
-        if ai_response.strip().startswith('{') and 'tool' in ai_response:
-            tool_call = json.loads(ai_response)
+        # JSON形式のツール呼び出しを検出（応答の中からJSONを抽出）
+        # {"tool": "...", "params": {...}} 形式を探す
+        json_match = re.search(r'\{"tool":\s*"[^"]+",\s*"params":\s*\{[^}]*\}\}', ai_response)
+        if not json_match:
+            # シンプルな形式も試す
+            json_match = re.search(r'\{[^{}]*"tool"[^{}]*\}', ai_response)
+        if json_match:
+            json_str = json_match.group()
+            tool_call = json.loads(json_str)
             print(f"ツール呼び出し: {tool_call}")
 
             # ツール実行
