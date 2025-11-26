@@ -1,0 +1,22 @@
+[Unit]
+Description=AI Necklace Voice Assistant
+After=network.target sound.target
+Wants=sound.target
+
+[Service]
+Type=simple
+User=hotaka
+Group=hotaka
+WorkingDirectory=/home/hotaka/ai-necklace
+Environment=PATH=/home/hotaka/ai-necklace/venv/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/hotaka/ai-necklace/venv/bin/python3 /home/hotaka/ai-necklace/ai_necklace.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# オーディオデバイスへのアクセス許可
+SupplementaryGroups=audio
+
+[Install]
+WantedBy=multi-user.target
