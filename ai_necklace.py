@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-AI Necklace - Raspberry Pi 5 スタンドアロン音声AIクライアント（Gmail・アラーム機能付き）
+AI Necklace - Raspberry Pi 5 スタンドアロン音声AIクライアント（Gmail・アラーム・カメラ機能付き）
 
 マイクから音声を録音し、OpenAI Whisper APIで文字起こし、
-GPTで応答生成（Gmail操作・アラーム操作含む）、OpenAI TTSで音声合成してスピーカーで再生する
+GPTで応答生成（Gmail操作・アラーム操作・カメラ操作含む）、OpenAI TTSで音声合成してスピーカーで再生する
 
 ボタン操作: GPIO5に接続したボタンを押している間録音（トランシーバー方式）
 
@@ -17,6 +17,10 @@ Gmail機能:
 - 「7時にアラームをセットして」→ アラーム設定
 - 「アラームを確認して」→ 一覧表示
 - 「アラームを削除して」→ 削除
+
+カメラ機能:
+- 「写真を撮って」「何が見える？」→ カメラで撮影してAIが説明
+- 「これは何？」「目の前にあるものを教えて」→ 画像認識
 """
 
 import os
@@ -34,6 +38,7 @@ from pathlib import Path
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta
+import subprocess
 
 import pyaudio
 import numpy as np
@@ -147,6 +152,13 @@ CONFIG = {
 ユーザーが「7時にアラームをセットして」と言ったら、alarm_setで時刻を"07:00"形式で設定してください。
 ユーザーが「アラームを確認」と言ったら、alarm_listでアラーム一覧を取得してください。
 ユーザーが「アラームを削除」と言ったら、alarm_deleteで削除してください。
+
+## カメラ機能
+
+8. camera_capture - カメラで撮影して画像を説明
+   - prompt: 画像に対する質問（オプション、例: "これは何？", "何が見える？"）
+
+ユーザーが「写真を撮って」「何が見える？」「これは何？」「目の前にあるものを教えて」「周りを見て」などと言ったら、camera_captureで撮影して説明してください。
 """,
 }
 
@@ -321,6 +333,83 @@ def start_alarm_thread():
     alarm_thread = threading.Thread(target=check_alarms_and_notify, daemon=True)
     alarm_thread.start()
     print("アラーム監視スレッド開始")
+
+
+# ==================== カメラ機能 ====================
+
+def camera_capture():
+    """カメラで写真を撮影"""
+    try:
+        # 一時ファイルパス
+        image_path = "/tmp/ai_necklace_capture.jpg"
+
+        # rpicam-stillで撮影（高速モードで撮影）
+        result = subprocess.run(
+            ["rpicam-still", "-o", image_path, "-t", "500", "--width", "1280", "--height", "960"],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+
+        if result.returncode != 0:
+            print(f"カメラエラー: {result.stderr}")
+            return None, "カメラでの撮影に失敗しました"
+
+        # 画像をbase64エンコード
+        with open(image_path, "rb") as f:
+            image_data = base64.b64encode(f.read()).decode("utf-8")
+
+        print(f"撮影成功: {image_path}")
+        return image_data, None
+
+    except subprocess.TimeoutExpired:
+        return None, "カメラの撮影がタイムアウトしました"
+    except FileNotFoundError:
+        return None, "rpicam-stillコマンドが見つかりません。カメラが正しく設定されていない可能性があります"
+    except Exception as e:
+        return None, f"カメラエラー: {str(e)}"
+
+
+def camera_describe(prompt="この画像に何が写っていますか？簡潔に説明してください。"):
+    """カメラで撮影してGPT-4oで画像を解析"""
+    global client
+
+    print("カメラで撮影中...")
+    image_data, error = camera_capture()
+
+    if error:
+        return error
+
+    print("画像を解析中...")
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": prompt + "\n\n日本語で回答してください。音声で読み上げるため、1-2文程度の簡潔な説明をお願いします。"
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{image_data}",
+                                "detail": "low"  # 高速化のためlowを使用
+                            }
+                        }
+                    ]
+                }
+            ],
+            max_tokens=300
+        )
+
+        return response.choices[0].message.content
+
+    except Exception as e:
+        return f"画像解析エラー: {str(e)}"
 
 
 def init_gmail():
@@ -608,6 +697,10 @@ def execute_tool(tool_call):
         return alarm_list()
     elif tool_name == 'alarm_delete':
         return alarm_delete(params.get('alarm_id'))
+    # カメラ機能
+    elif tool_name == 'camera_capture':
+        prompt = params.get('prompt', 'この画像に何が写っていますか？簡潔に説明してください。')
+        return camera_describe(prompt)
     else:
         return f"不明なツール: {tool_name}"
 
@@ -985,6 +1078,12 @@ def main():
     print("  - 「アラームを確認して」")
     print("  - 「アラームを削除して」")
     print(f"  現在のアラーム: {len(alarms)}件")
+
+    print("\nカメラコマンド例:")
+    print("  - 「写真を撮って」")
+    print("  - 「何が見える？」")
+    print("  - 「これは何？」")
+    print("  - 「目の前にあるものを教えて」")
     print("=" * 50)
 
     try:
