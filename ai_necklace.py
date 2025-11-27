@@ -746,25 +746,52 @@ def record_audio_while_pressed():
         rate=CONFIG["sample_rate"],
         input=True,
         input_device_index=input_device,
-        frames_per_buffer=CONFIG["chunk_size"]
+        frames_per_buffer=CONFIG["chunk_size"],
+        stream_callback=None
     )
 
     frames = []
     max_chunks = int(CONFIG["sample_rate"] / CONFIG["chunk_size"] * CONFIG["max_record_seconds"])
 
+    # タイムアウト設定（60秒）
+    recording_timeout = 60
+    start_time = time.time()
+
     with record_lock:
         is_recording = True
 
-    for i in range(max_chunks):
+    while True:
         if not running:
             break
 
+        # タイムアウトチェック
+        elapsed_time = time.time() - start_time
+        if elapsed_time > recording_timeout:
+            print(f"録音タイムアウト ({recording_timeout}秒経過)、録音終了")
+            break
+
+        # ボタンチェック（最優先）
         if button and not button.is_pressed:
             print("ボタンが離されました、録音終了")
             break
 
-        data = stream.read(CONFIG["chunk_size"], exception_on_overflow=False)
-        frames.append(data)
+        # 最大録音時間チェック
+        if len(frames) >= max_chunks:
+            print("最大録音時間に達しました、録音終了")
+            break
+
+        try:
+            # stream.get_read_available()でデータが利用可能かチェック
+            available = stream.get_read_available()
+            if available >= CONFIG["chunk_size"]:
+                data = stream.read(CONFIG["chunk_size"], exception_on_overflow=False)
+                frames.append(data)
+            else:
+                # データがまだ準備できていない場合は短時間待機（ボタンチェック優先のため短く）
+                time.sleep(0.001)  # 1msに短縮
+        except Exception as e:
+            print(f"録音中にエラー: {e}")
+            break
 
     with record_lock:
         is_recording = False
