@@ -1,11 +1,22 @@
 #!/usr/bin/env python3
 """
-AI Necklace - Raspberry Pi 5 スタンドアロン音声AIクライアント
+AI Necklace - Raspberry Pi 5 スタンドアロン音声AIクライアント（Gmail・アラーム機能付き）
 
 マイクから音声を録音し、OpenAI Whisper APIで文字起こし、
-Claude/GPTで応答生成、OpenAI TTSで音声合成してスピーカーで再生する
+GPTで応答生成（Gmail操作・アラーム操作含む）、OpenAI TTSで音声合成してスピーカーで再生する
 
-ボタン操作: GPIO17に接続したボタンを押している間録音（トランシーバー方式）
+ボタン操作: GPIO5に接続したボタンを押している間録音（トランシーバー方式）
+
+Gmail機能:
+- 「メールを確認」「メールを読んで」→ 未読メール一覧
+- 「○○からのメール」→ 特定の送信者のメール
+- 「メールに返信して」→ 返信作成
+- 「メールを送って」→ 新規メール作成
+
+アラーム機能:
+- 「7時にアラームをセットして」→ アラーム設定
+- 「アラームを確認して」→ 一覧表示
+- 「アラームを削除して」→ 削除
 """
 
 import os
@@ -16,12 +27,25 @@ import time
 import signal
 import sys
 import threading
+import json
+import base64
+import re
 from pathlib import Path
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from datetime import datetime, timedelta
 
 import pyaudio
 import numpy as np
 from openai import OpenAI
 from dotenv import load_dotenv
+
+# Gmail API
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 # GPIOライブラリ
 try:
@@ -38,35 +62,92 @@ sys.stderr.reconfigure(line_buffering=True)
 # 環境変数の読み込み
 load_dotenv()
 
+# Gmail APIスコープ
+GMAIL_SCOPES = [
+    'https://www.googleapis.com/auth/gmail.readonly',
+    'https://www.googleapis.com/auth/gmail.send',
+    'https://www.googleapis.com/auth/gmail.modify'
+]
+
 # 設定
 CONFIG = {
     # オーディオ設定
-    "sample_rate": 44100,  # USBマイクがサポートするレート (44100 or 48000)
+    "sample_rate": 44100,
     "channels": 1,
     "chunk_size": 1024,
-    "max_record_seconds": 30,  # 最大録音時間（ボタン押しっぱなし対策）
-    "silence_threshold": 500,  # 無音判定閾値
+    "max_record_seconds": 30,
+    "silence_threshold": 500,
 
-    # デバイス設定（arecord -l, aplay -l で確認した値）
-    "input_device_index": None,  # Noneで自動検出
-    "output_device_index": None,  # Noneで自動検出
+    # デバイス設定
+    "input_device_index": None,
+    "output_device_index": None,
 
     # GPIO設定
-    "button_pin": 5,  # GPIO5 (物理ピン29)
-    "use_button": True,  # ボタン操作を使用するか
+    "button_pin": 5,
+    "use_button": True,
 
     # AI設定
     "whisper_model": "whisper-1",
     "tts_model": "tts-1",
-    "tts_voice": "nova",  # alloy, echo, fable, onyx, nova, shimmer
+    "tts_voice": "nova",
     "tts_speed": 1.2,
-    "chat_model": "gpt-4o-mini",  # gpt-4o, gpt-4o-mini, gpt-3.5-turbo
+    "chat_model": "gpt-4o-mini",
+
+    # Gmail設定
+    "gmail_credentials_path": os.path.expanduser("~/.ai-necklace/credentials.json"),
+    "gmail_token_path": os.path.expanduser("~/.ai-necklace/token.json"),
 
     # システムプロンプト
     "system_prompt": """あなたは親切なAIアシスタントです。
 ユーザーの質問に簡潔に答えてください。
 音声で読み上げられるため、1-2文程度の短い応答を心がけてください。
-日本語で回答してください。""",
+日本語で回答してください。
+
+あなたはGmailの操作も可能です。以下のツールを使用できます:
+
+## 利用可能なツール
+
+1. gmail_list - メール一覧取得
+   - query: 検索クエリ（例: "is:unread", "from:xxx@gmail.com"）
+   - max_results: 取得件数（デフォルト5）
+
+2. gmail_read - メール本文読み取り
+   - message_id: メールID
+
+3. gmail_send - 新規メール送信
+   - to: 宛先メールアドレス
+   - subject: 件名
+   - body: 本文
+
+4. gmail_reply - メール返信
+   - message_id: 返信するメールのID
+   - body: 返信本文
+
+ツールを使う場合は、以下のJSON形式で応答してください:
+{"tool": "ツール名", "params": {パラメータ}}
+
+ツールを使わない通常の応答の場合は、普通にテキストで回答してください。
+
+ユーザーが「メールを確認」「メールを読んで」と言ったら、gmail_listで未読メールを確認してください。
+ユーザーが特定のメールの詳細を聞いたら、gmail_readで本文を取得してください。
+ユーザーが「メールを送って」と言ったら、宛先・件名・本文を確認してgmail_sendを使ってください。
+
+## アラーム機能
+
+5. alarm_set - アラーム設定
+   - time: 時刻（HH:MM形式、例: "07:00", "14:30"）
+   - label: ラベル（オプション、例: "起床"）
+   - message: 読み上げメッセージ（オプション）
+
+6. alarm_list - アラーム一覧取得
+
+7. alarm_delete - アラーム削除
+   - alarm_id: アラームID（番号）
+
+ユーザーが「7時にアラームをセットして」と言ったら、alarm_setで時刻を"07:00"形式で設定してください。
+ユーザーが「アラームを確認」と言ったら、alarm_listでアラーム一覧を取得してください。
+ユーザーが「アラームを削除」と言ったら、alarm_deleteで削除してください。
+""",
 }
 
 # グローバル変数
@@ -76,6 +157,15 @@ audio = None
 button = None
 is_recording = False
 record_lock = threading.Lock()
+gmail_service = None
+conversation_history = []
+last_email_list = []  # 直近のメール一覧を保持
+
+# アラーム関連
+alarms = []  # アラームリスト
+alarm_next_id = 1
+alarm_thread = None
+alarm_file_path = os.path.expanduser("~/.ai-necklace/alarms.json")
 
 
 def signal_handler(sig, frame):
@@ -83,6 +173,443 @@ def signal_handler(sig, frame):
     global running
     print("\n終了します...")
     running = False
+
+
+# ==================== アラーム機能 ====================
+
+def load_alarms():
+    """保存されたアラームを読み込み"""
+    global alarms, alarm_next_id
+    try:
+        if os.path.exists(alarm_file_path):
+            with open(alarm_file_path, 'r') as f:
+                data = json.load(f)
+                alarms = data.get('alarms', [])
+                alarm_next_id = data.get('next_id', 1)
+                print(f"アラーム読み込み: {len(alarms)}件")
+    except Exception as e:
+        print(f"アラーム読み込みエラー: {e}")
+        alarms = []
+        alarm_next_id = 1
+
+
+def save_alarms():
+    """アラームを保存"""
+    global alarms, alarm_next_id
+    try:
+        os.makedirs(os.path.dirname(alarm_file_path), exist_ok=True)
+        with open(alarm_file_path, 'w') as f:
+            json.dump({'alarms': alarms, 'next_id': alarm_next_id}, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"アラーム保存エラー: {e}")
+
+
+def alarm_set(time_str, label="アラーム", message=""):
+    """アラームを設定"""
+    global alarms, alarm_next_id
+
+    # 時刻のバリデーション
+    try:
+        hour, minute = map(int, time_str.split(':'))
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            return "時刻が不正です。00:00〜23:59の形式で指定してください。"
+    except:
+        return "時刻の形式が不正です。HH:MM形式（例: 07:00）で指定してください。"
+
+    alarm = {
+        "id": alarm_next_id,
+        "time": time_str,
+        "label": label,
+        "message": message or f"{label}の時間です",
+        "enabled": True,
+        "created_at": datetime.now().isoformat()
+    }
+
+    alarms.append(alarm)
+    alarm_next_id += 1
+    save_alarms()
+
+    return f"{time_str}に「{label}」のアラームを設定しました。"
+
+
+def alarm_list():
+    """アラーム一覧を取得"""
+    global alarms
+
+    if not alarms:
+        return "設定されているアラームはありません。"
+
+    result = "アラーム一覧:\n"
+    for alarm in alarms:
+        status = "有効" if alarm.get("enabled", True) else "無効"
+        result += f"{alarm['id']}. {alarm['time']} - {alarm['label']} ({status})\n"
+
+    return result.strip()
+
+
+def alarm_delete(alarm_id):
+    """アラームを削除"""
+    global alarms
+
+    try:
+        alarm_id = int(alarm_id)
+    except:
+        return "アラームIDは数字で指定してください。"
+
+    for i, alarm in enumerate(alarms):
+        if alarm['id'] == alarm_id:
+            deleted = alarms.pop(i)
+            save_alarms()
+            return f"「{deleted['label']}」({deleted['time']})のアラームを削除しました。"
+
+    return f"ID {alarm_id} のアラームが見つかりません。"
+
+
+def check_alarms_and_notify():
+    """アラームをチェックして通知（バックグラウンドスレッド用）"""
+    global running, alarms, client, audio
+
+    last_triggered = {}  # 同じアラームが連続で鳴らないように
+
+    while running:
+        try:
+            now = datetime.now()
+            current_time = now.strftime("%H:%M")
+
+            for alarm in alarms:
+                if not alarm.get("enabled", True):
+                    continue
+
+                alarm_id = alarm['id']
+                alarm_time = alarm['time']
+
+                # 同じ分に複数回鳴らないようにチェック
+                trigger_key = f"{alarm_id}_{current_time}"
+                if trigger_key in last_triggered:
+                    continue
+
+                if alarm_time == current_time:
+                    print(f"アラーム発動: {alarm['label']} ({alarm_time})")
+                    last_triggered[trigger_key] = True
+
+                    # 録音中でなければ通知
+                    with record_lock:
+                        if not is_recording:
+                            try:
+                                # TTSで読み上げ
+                                message = alarm.get('message', f"{alarm['label']}の時間です")
+                                speech_audio = text_to_speech(f"アラームです。{message}")
+                                play_audio(speech_audio)
+                            except Exception as e:
+                                print(f"アラーム通知エラー: {e}")
+
+            # 古いトリガー記録をクリア（1分以上前のもの）
+            current_minute = now.strftime("%H:%M")
+            keys_to_remove = [k for k in last_triggered if not k.endswith(current_minute)]
+            for k in keys_to_remove:
+                del last_triggered[k]
+
+        except Exception as e:
+            print(f"アラームチェックエラー: {e}")
+
+        time.sleep(10)  # 10秒ごとにチェック
+
+
+def start_alarm_thread():
+    """アラーム監視スレッドを開始"""
+    global alarm_thread
+    alarm_thread = threading.Thread(target=check_alarms_and_notify, daemon=True)
+    alarm_thread.start()
+    print("アラーム監視スレッド開始")
+
+
+def init_gmail():
+    """Gmail API初期化"""
+    global gmail_service
+
+    creds = None
+    token_path = CONFIG["gmail_token_path"]
+    credentials_path = CONFIG["gmail_credentials_path"]
+
+    # トークンファイルが存在する場合は読み込み
+    if os.path.exists(token_path):
+        creds = Credentials.from_authorized_user_file(token_path, GMAIL_SCOPES)
+
+    # トークンが無効または存在しない場合は認証フロー
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            if not os.path.exists(credentials_path):
+                print(f"警告: Gmail認証情報が見つかりません: {credentials_path}")
+                print("Gmail機能は無効です。")
+                return False
+
+            flow = InstalledAppFlow.from_client_secrets_file(
+                credentials_path, GMAIL_SCOPES)
+            creds = flow.run_local_server(port=0)
+
+        # トークンを保存
+        os.makedirs(os.path.dirname(token_path), exist_ok=True)
+        with open(token_path, 'w') as token:
+            token.write(creds.to_json())
+
+    try:
+        gmail_service = build('gmail', 'v1', credentials=creds)
+        print("Gmail API初期化完了")
+        return True
+    except Exception as e:
+        print(f"Gmail API初期化エラー: {e}")
+        return False
+
+
+def gmail_list(query="is:unread", max_results=5):
+    """メール一覧を取得"""
+    global gmail_service, last_email_list
+
+    if not gmail_service:
+        return "Gmail機能が初期化されていません"
+
+    try:
+        results = gmail_service.users().messages().list(
+            userId='me',
+            q=query,
+            maxResults=max_results
+        ).execute()
+
+        messages = results.get('messages', [])
+
+        if not messages:
+            return "該当するメールはありません"
+
+        email_list = []
+        last_email_list = []
+
+        for i, msg in enumerate(messages, 1):
+            msg_detail = gmail_service.users().messages().get(
+                userId='me',
+                id=msg['id'],
+                format='metadata',
+                metadataHeaders=['From', 'Subject', 'Date']
+            ).execute()
+
+            headers = {h['name']: h['value'] for h in msg_detail.get('payload', {}).get('headers', [])}
+
+            # 送信者名を抽出
+            from_header = headers.get('From', '不明')
+            from_match = re.match(r'(.+?)\s*<', from_header)
+            from_name = from_match.group(1).strip() if from_match else from_header.split('@')[0]
+
+            email_info = {
+                'id': msg['id'],
+                'from': from_name,
+                'from_email': from_header,  # 返信用に完全なメールアドレスを保持
+                'subject': headers.get('Subject', '(件名なし)'),
+                'date': headers.get('Date', ''),
+            }
+            last_email_list.append(email_info)
+            print(f"メール保存: ID={msg['id']}, From={from_header}")  # デバッグログ
+            email_list.append(f"{i}. {from_name}さんから: {email_info['subject']}")
+
+        return "メール一覧:\n" + "\n".join(email_list)
+
+    except HttpError as e:
+        return f"メール取得エラー: {e}"
+
+
+def gmail_read(message_id):
+    """メール本文を読み取り"""
+    global gmail_service
+
+    if not gmail_service:
+        return "Gmail機能が初期化されていません"
+
+    try:
+        msg = gmail_service.users().messages().get(
+            userId='me',
+            id=message_id,
+            format='full'
+        ).execute()
+
+        headers = {h['name']: h['value'] for h in msg.get('payload', {}).get('headers', [])}
+
+        # 本文を取得
+        body = ""
+        payload = msg.get('payload', {})
+
+        if 'body' in payload and payload['body'].get('data'):
+            body = base64.urlsafe_b64decode(payload['body']['data']).decode('utf-8')
+        elif 'parts' in payload:
+            for part in payload['parts']:
+                if part.get('mimeType') == 'text/plain' and part.get('body', {}).get('data'):
+                    body = base64.urlsafe_b64decode(part['body']['data']).decode('utf-8')
+                    break
+
+        # 長すぎる場合は切り詰め
+        if len(body) > 500:
+            body = body[:500] + "...(以下省略)"
+
+        from_header = headers.get('From', '不明')
+        from_match = re.match(r'(.+?)\s*<', from_header)
+        from_name = from_match.group(1).strip() if from_match else from_header
+
+        return f"送信者: {from_name}\n件名: {headers.get('Subject', '(件名なし)')}\n\n本文:\n{body}"
+
+    except HttpError as e:
+        return f"メール読み取りエラー: {e}"
+
+
+def gmail_send(to, subject, body):
+    """新規メール送信"""
+    global gmail_service
+
+    if not gmail_service:
+        return "Gmail機能が初期化されていません"
+
+    try:
+        message = MIMEText(body)
+        message['to'] = to
+        message['subject'] = subject
+
+        raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
+
+        gmail_service.users().messages().send(
+            userId='me',
+            body={'raw': raw}
+        ).execute()
+
+        return f"{to}にメールを送信しました"
+
+    except HttpError as e:
+        return f"メール送信エラー: {e}"
+
+
+def extract_email_address(email_str):
+    """メールアドレス部分を抽出（例: '"名前" <test@example.com>' → 'test@example.com'）"""
+    if not email_str:
+        return None
+    # <email@example.com> 形式からメールアドレスを抽出
+    match = re.search(r'<([^>]+)>', email_str)
+    if match:
+        return match.group(1)
+    # @が含まれていればそのまま使用
+    if '@' in email_str:
+        return email_str.strip()
+    return None
+
+
+def gmail_reply(message_id, body, to_email=None):
+    """メール返信"""
+    global gmail_service
+
+    if not gmail_service:
+        return "Gmail機能が初期化されていません"
+
+    try:
+        # 元のメールを取得
+        original = gmail_service.users().messages().get(
+            userId='me',
+            id=message_id,
+            format='metadata',
+            metadataHeaders=['From', 'Subject', 'Message-ID', 'References', 'Reply-To']
+        ).execute()
+
+        headers = {h['name']: h['value'] for h in original.get('payload', {}).get('headers', [])}
+
+        # 返信先（Reply-Toがあればそれを使う、なければFrom）
+        to_raw = to_email or headers.get('Reply-To') or headers.get('From', '')
+        to = extract_email_address(to_raw)
+
+        if not to:
+            return "返信先のメールアドレスが取得できませんでした"
+
+        subject = headers.get('Subject', '')
+        if not subject.startswith('Re:'):
+            subject = 'Re: ' + subject
+
+        # スレッド情報
+        thread_id = original.get('threadId')
+        message_id_header = headers.get('Message-ID', '')
+        references = headers.get('References', '')
+
+        message = MIMEText(body)
+        message['to'] = to
+        message['subject'] = subject
+        if message_id_header:
+            message['In-Reply-To'] = message_id_header
+            message['References'] = f"{references} {message_id_header}".strip()
+
+        raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
+
+        gmail_service.users().messages().send(
+            userId='me',
+            body={'raw': raw, 'threadId': thread_id}
+        ).execute()
+
+        # 送信先の名前を抽出
+        to_match = re.match(r'(.+?)\s*<', to)
+        to_name = to_match.group(1).strip() if to_match else to.split('@')[0]
+
+        return f"{to_name}さんに返信を送信しました"
+
+    except HttpError as e:
+        return f"返信エラー: {e}"
+
+
+def execute_tool(tool_call):
+    """ツール呼び出しを実行"""
+    global last_email_list
+
+    tool_name = tool_call.get('tool')
+    params = tool_call.get('params', {})
+
+    if tool_name == 'gmail_list':
+        return gmail_list(
+            query=params.get('query', 'is:unread'),
+            max_results=params.get('max_results', 5)
+        )
+    elif tool_name == 'gmail_read':
+        # 番号で指定された場合
+        msg_id = params.get('message_id')
+        if isinstance(msg_id, int) or (isinstance(msg_id, str) and msg_id.isdigit()):
+            idx = int(msg_id) - 1
+            if 0 <= idx < len(last_email_list):
+                msg_id = last_email_list[idx]['id']
+            else:
+                return "指定されたメールが見つかりません"
+        return gmail_read(msg_id)
+    elif tool_name == 'gmail_send':
+        return gmail_send(
+            to=params.get('to'),
+            subject=params.get('subject'),
+            body=params.get('body')
+        )
+    elif tool_name == 'gmail_reply':
+        msg_id = params.get('message_id')
+        to_email = None
+        if isinstance(msg_id, int) or (isinstance(msg_id, str) and msg_id.isdigit()):
+            idx = int(msg_id) - 1
+            print(f"返信処理: idx={idx}, last_email_list長さ={len(last_email_list)}")  # デバッグログ
+            if 0 <= idx < len(last_email_list):
+                msg_id = last_email_list[idx]['id']
+                to_email = last_email_list[idx].get('from_email')
+                print(f"返信先: msg_id={msg_id}, to_email={to_email}")  # デバッグログ
+            else:
+                return "指定されたメールが見つかりません。先に「メールを確認して」と言ってください。"
+        return gmail_reply(msg_id, params.get('body'), to_email)
+    # アラーム機能
+    elif tool_name == 'alarm_set':
+        return alarm_set(
+            time_str=params.get('time'),
+            label=params.get('label', 'アラーム'),
+            message=params.get('message', '')
+        )
+    elif tool_name == 'alarm_list':
+        return alarm_list()
+    elif tool_name == 'alarm_delete':
+        return alarm_delete(params.get('alarm_id'))
+    else:
+        return f"不明なツール: {tool_name}"
 
 
 def find_audio_device(p, device_type="input"):
@@ -104,7 +631,6 @@ def find_audio_device(p, device_type="input"):
                     print(f"出力デバイス検出: [{i}] {name}")
                     return i
 
-    # 見つからない場合はデフォルト
     if device_type == "input":
         return p.get_default_input_device_info()["index"]
     else:
@@ -140,7 +666,6 @@ def record_audio_while_pressed():
         if not running:
             break
 
-        # ボタンが離されたら終了
         if button and not button.is_pressed:
             print("ボタンが離されました、録音終了")
             break
@@ -154,11 +679,10 @@ def record_audio_while_pressed():
     stream.stop_stream()
     stream.close()
 
-    if len(frames) < 5:  # 短すぎる録音は無視
+    if len(frames) < 5:
         print("録音が短すぎます")
         return None
 
-    # WAVデータに変換
     wav_buffer = io.BytesIO()
     with wave.open(wav_buffer, 'wb') as wf:
         wf.setnchannels(CONFIG["channels"])
@@ -192,7 +716,7 @@ def record_audio_auto():
     frames = []
     silent_chunks = 0
     has_sound = False
-    max_chunks = int(CONFIG["sample_rate"] / CONFIG["chunk_size"] * 5)  # 5秒
+    max_chunks = int(CONFIG["sample_rate"] / CONFIG["chunk_size"] * 5)
     silence_duration = 1.5
     silence_chunks_threshold = int(CONFIG["sample_rate"] / CONFIG["chunk_size"] * silence_duration)
 
@@ -203,7 +727,6 @@ def record_audio_auto():
         data = stream.read(CONFIG["chunk_size"], exception_on_overflow=False)
         frames.append(data)
 
-        # 音量チェック
         audio_data = np.frombuffer(data, dtype=np.int16)
         volume = np.abs(audio_data).mean()
 
@@ -213,7 +736,6 @@ def record_audio_auto():
         else:
             silent_chunks += 1
 
-        # 音声検出後、無音が続いたら終了
         if has_sound and silent_chunks > silence_chunks_threshold:
             print("無音検出、録音終了")
             break
@@ -225,7 +747,6 @@ def record_audio_auto():
         print("音声が検出されませんでした")
         return None
 
-    # WAVデータに変換
     wav_buffer = io.BytesIO()
     with wave.open(wav_buffer, 'wb') as wf:
         wf.setnchannels(CONFIG["channels"])
@@ -243,7 +764,6 @@ def transcribe_audio(audio_data):
 
     print("音声認識中...")
 
-    # 一時ファイルに保存
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
         f.write(audio_data.read())
         temp_path = f.name
@@ -261,21 +781,70 @@ def transcribe_audio(audio_data):
 
 
 def get_ai_response(text):
-    """AIからの応答を取得"""
-    global client
+    """AIからの応答を取得（ツール呼び出し対応）"""
+    global client, conversation_history
 
     print(f"AI処理中... (入力: {text})")
 
+    # 会話履歴に追加
+    conversation_history.append({"role": "user", "content": text})
+
+    # 履歴が長くなりすぎたら古いものを削除
+    if len(conversation_history) > 10:
+        conversation_history = conversation_history[-10:]
+
+    messages = [
+        {"role": "system", "content": CONFIG["system_prompt"]}
+    ] + conversation_history
+
     response = client.chat.completions.create(
         model=CONFIG["chat_model"],
-        messages=[
-            {"role": "system", "content": CONFIG["system_prompt"]},
-            {"role": "user", "content": text}
-        ],
-        max_tokens=200
+        messages=messages,
+        max_tokens=500
     )
 
-    return response.choices[0].message.content
+    ai_response = response.choices[0].message.content
+
+    # ツール呼び出しかチェック（応答内にJSONが含まれているか）
+    try:
+        # JSON形式のツール呼び出しを検出（応答の中からJSONを抽出）
+        # {"tool": "...", "params": {...}} 形式を探す
+        json_match = re.search(r'\{"tool":\s*"[^"]+",\s*"params":\s*\{[^}]*\}\}', ai_response)
+        if not json_match:
+            # シンプルな形式も試す
+            json_match = re.search(r'\{[^{}]*"tool"[^{}]*\}', ai_response)
+        if json_match:
+            json_str = json_match.group()
+            tool_call = json.loads(json_str)
+            print(f"ツール呼び出し: {tool_call}")
+
+            # ツール実行
+            tool_result = execute_tool(tool_call)
+            print(f"ツール結果: {tool_result}")
+
+            # ツール結果を含めて再度AIに問い合わせ
+            conversation_history.append({"role": "assistant", "content": ai_response})
+            conversation_history.append({"role": "user", "content": f"ツール実行結果:\n{tool_result}\n\nこの結果を音声で読み上げるために、簡潔に日本語で要約してください。"})
+
+            messages = [
+                {"role": "system", "content": CONFIG["system_prompt"]}
+            ] + conversation_history
+
+            summary_response = client.chat.completions.create(
+                model=CONFIG["chat_model"],
+                messages=messages,
+                max_tokens=300
+            )
+
+            final_response = summary_response.choices[0].message.content
+            conversation_history.append({"role": "assistant", "content": final_response})
+            return final_response
+
+    except json.JSONDecodeError:
+        pass  # JSONでない場合は通常の応答として処理
+
+    conversation_history.append({"role": "assistant", "content": ai_response})
+    return ai_response
 
 
 def text_to_speech(text):
@@ -305,7 +874,6 @@ def play_audio(audio_data):
 
     print("再生中...")
 
-    # WAVデータを読み込み
     wav_buffer = io.BytesIO(audio_data)
     with wave.open(wav_buffer, 'rb') as wf:
         stream = audio.open(
@@ -331,7 +899,6 @@ def process_voice():
     """音声処理のメインフロー"""
     global button
 
-    # 録音（ボタンモードまたは自動モード）
     if CONFIG["use_button"] and button:
         audio_data = record_audio_while_pressed()
     else:
@@ -340,7 +907,6 @@ def process_voice():
     if audio_data is None:
         return
 
-    # 音声認識
     text = transcribe_audio(audio_data)
     if not text or text.strip() == "":
         print("テキストが認識できませんでした")
@@ -348,14 +914,10 @@ def process_voice():
 
     print(f"\n[あなた] {text}")
 
-    # AI応答生成
     response = get_ai_response(text)
     print(f"[AI] {response}")
 
-    # 音声合成
     speech_audio = text_to_speech(response)
-
-    # 再生
     play_audio(speech_audio)
 
 
@@ -363,27 +925,28 @@ def main():
     """メインループ"""
     global running, client, audio, button
 
-    # シグナルハンドラ設定
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # APIキー確認
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         print("エラー: OPENAI_API_KEY が設定されていません")
         print(".env ファイルに OPENAI_API_KEY=sk-... を設定してください")
         sys.exit(1)
 
-    # OpenAIクライアント初期化
     client = OpenAI(api_key=api_key)
-
-    # PyAudio初期化
     audio = pyaudio.PyAudio()
+
+    # Gmail初期化
+    gmail_available = init_gmail()
+
+    # アラーム初期化
+    load_alarms()
+    start_alarm_thread()
 
     # ボタン初期化
     if CONFIG["use_button"] and GPIO_AVAILABLE:
         try:
-            # pull_up=True: 通常HIGH、押すとLOW（アクティブLOW）
             button = Button(CONFIG["button_pin"], pull_up=True, bounce_time=0.1)
             print(f"ボタン初期化完了: GPIO{CONFIG['button_pin']}")
         except Exception as e:
@@ -398,10 +961,11 @@ def main():
             CONFIG["use_button"] = False
 
     print("=" * 50)
-    print("AI Necklace 起動")
+    print("AI Necklace 起動 (Gmail・アラーム機能付き)")
     print("=" * 50)
     print(f"Chat Model: {CONFIG['chat_model']}")
     print(f"TTS Voice: {CONFIG['tts_voice']}")
+    print(f"Gmail: {'有効' if gmail_available else '無効'}")
     if CONFIG["use_button"]:
         print(f"操作方法: GPIO{CONFIG['button_pin']}のボタンを押している間録音")
     else:
@@ -409,18 +973,30 @@ def main():
     print("Ctrl+C で終了")
     print("=" * 50)
 
+    if gmail_available:
+        print("\nGmailコマンド例:")
+        print("  - 「メールを確認して」")
+        print("  - 「未読メールを読んで」")
+        print("  - 「1番目のメールを読んで」")
+        print("  - 「○○にメールを送って」")
+
+    print("\nアラームコマンド例:")
+    print("  - 「7時にアラームをセットして」")
+    print("  - 「アラームを確認して」")
+    print("  - 「アラームを削除して」")
+    print(f"  現在のアラーム: {len(alarms)}件")
+    print("=" * 50)
+
     try:
         if CONFIG["use_button"] and button:
-            # ボタンモード: ボタンが押されたら録音開始
             print("\n--- ボタンを押して話しかけてください ---")
             while running:
                 if button.is_pressed:
                     process_voice()
                     if running:
                         print("\n--- ボタンを押して話しかけてください ---")
-                time.sleep(0.05)  # CPU負荷軽減
+                time.sleep(0.05)
         else:
-            # 自動モード: 常時録音待機
             while running:
                 print("\n--- 待機中 (話しかけてください) ---")
                 process_voice()
