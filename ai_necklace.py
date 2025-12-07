@@ -37,6 +37,8 @@ import re
 from pathlib import Path
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
 from datetime import datetime, timedelta
 import subprocess
 
@@ -124,18 +126,26 @@ CONFIG = {
    - subject: 件名
    - body: 本文
 
-4. gmail_reply - メール返信
-   - message_id: 返信するメールのID
+4. gmail_reply - メール返信（写真添付も可能）
+   - message_id: 返信するメールの番号（1, 2, 3など。gmail_listで表示された番号を使用）
    - body: 返信本文
+   - attach_photo: 写真を撮影して添付するか（true/false、デフォルト: false）
 
 ツールを使う場合は、以下のJSON形式で応答してください:
 {"tool": "ツール名", "params": {パラメータ}}
 
 ツールを使わない通常の応答の場合は、普通にテキストで回答してください。
 
+重要なルール:
+- message_idには必ず数字（1, 2, 3など）を使ってください。「先ほどのメール」などの文字列は使わないでください。
+- 写真付きで返信する場合は必ず attach_photo: true を含めてください。
+- メールに返信する前に、gmail_listでメール一覧を取得していない場合は、まずgmail_listを実行してください。
+
 ユーザーが「メールを確認」「メールを読んで」と言ったら、gmail_listで未読メールを確認してください。
 ユーザーが特定のメールの詳細を聞いたら、gmail_readで本文を取得してください。
 ユーザーが「メールを送って」と言ったら、宛先・件名・本文を確認してgmail_sendを使ってください。
+ユーザーが「さっきのメールに返信」「1番目のメールに返信」と言ったら、message_id: 1 を使ってgmail_replyを実行してください。
+ユーザーが「写真付きで返信」と言ったら、gmail_replyにattach_photo: trueを必ず含めてください。例: {"tool": "gmail_reply", "params": {"message_id": 1, "body": "写真を送ります", "attach_photo": true}}
 
 ## アラーム機能
 
@@ -158,7 +168,15 @@ CONFIG = {
 8. camera_capture - カメラで撮影して画像を説明
    - prompt: 画像に対する質問（オプション、例: "これは何？", "何が見える？"）
 
+9. gmail_send_photo - 写真を撮影してメールで送信
+   - to: 宛先メールアドレス（オプション、省略時は直前にやり取りしたメールの送信者に送る）
+   - subject: 件名（オプション、デフォルト: "写真を送ります"）
+   - body: 本文（オプション）
+
 ユーザーが「写真を撮って」「何が見える？」「これは何？」「目の前にあるものを教えて」「周りを見て」などと言ったら、camera_captureで撮影して説明してください。
+ユーザーが「写真を撮って○○に送って」などと言ったら、gmail_send_photoで写真を撮影して送信してください。
+ユーザーが「さっきの人に写真を送って」「写真を送って」（宛先なし）と言ったら、gmail_send_photoをtoパラメータなしで呼び出してください。直前にメールをやり取りした相手に送信されます。
+ユーザーが「このメールに写真付きで返信して」「写真を添付して返信」と言ったら、gmail_replyにattach_photo=trueを指定してください。
 """,
 }
 
@@ -573,6 +591,88 @@ def gmail_send(to, subject, body):
         return f"メール送信エラー: {e}"
 
 
+def gmail_send_photo(to=None, subject="写真を送ります", body="", take_photo=True):
+    """写真付きメール送信（toが省略された場合は直前のメール相手に送信）"""
+    global gmail_service, last_email_list
+
+    if not gmail_service:
+        return "Gmail機能が初期化されていません"
+
+    # toが指定されていない場合、直前のメール相手を使用
+    if not to:
+        if not last_email_list:
+            return "送信先が指定されていません。先に「メールを確認して」と言うか、宛先を指定してください。"
+        # 直前のメール一覧の最初の送信者を使用
+        to = extract_email_address(last_email_list[0].get('from_email', ''))
+        if not to:
+            return "直前のメール送信者のアドレスが取得できませんでした"
+        print(f"直前のメール相手に送信: {to}")
+
+    try:
+        # 写真を撮影
+        if take_photo:
+            print("写真を撮影中...")
+            image_path = "/tmp/ai_necklace_capture.jpg"
+            result = subprocess.run(
+                ["rpicam-still", "-o", image_path, "-t", "500", "--width", "1280", "--height", "960"],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            if result.returncode != 0:
+                return f"写真の撮影に失敗しました: {result.stderr}"
+        else:
+            image_path = "/tmp/ai_necklace_capture.jpg"
+            if not os.path.exists(image_path):
+                return "送信する写真がありません。先に写真を撮影してください。"
+
+        # MIMEマルチパートメッセージを作成
+        message = MIMEMultipart()
+        message['to'] = to
+        message['subject'] = subject
+
+        # 本文を追加
+        if body:
+            message.attach(MIMEText(body, 'plain'))
+        else:
+            message.attach(MIMEText("写真を送ります。", 'plain'))
+
+        # 画像を添付
+        with open(image_path, 'rb') as f:
+            img_data = f.read()
+
+        img_part = MIMEBase('image', 'jpeg')
+        img_part.set_payload(img_data)
+        encoders.encode_base64(img_part)
+
+        # ファイル名を設定（日時を含める）
+        filename = f"photo_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+        img_part.add_header('Content-Disposition', 'attachment', filename=filename)
+        message.attach(img_part)
+
+        # 送信
+        raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
+        gmail_service.users().messages().send(
+            userId='me',
+            body={'raw': raw}
+        ).execute()
+
+        # 送信先の名前を抽出
+        to_match = re.match(r'(.+?)\s*<', to)
+        to_name = to_match.group(1).strip() if to_match else to.split('@')[0]
+
+        return f"{to_name}さんに写真付きメールを送信しました"
+
+    except subprocess.TimeoutExpired:
+        return "カメラの撮影がタイムアウトしました"
+    except FileNotFoundError:
+        return "カメラが見つかりません"
+    except HttpError as e:
+        return f"メール送信エラー: {e}"
+    except Exception as e:
+        return f"写真付きメール送信エラー: {str(e)}"
+
+
 def extract_email_address(email_str):
     """メールアドレス部分を抽出（例: '"名前" <test@example.com>' → 'test@example.com'）"""
     if not email_str:
@@ -587,14 +687,28 @@ def extract_email_address(email_str):
     return None
 
 
-def gmail_reply(message_id, body, to_email=None):
-    """メール返信"""
+def gmail_reply(message_id, body, to_email=None, attach_photo=False):
+    """メール返信（写真添付オプション付き）"""
     global gmail_service
 
     if not gmail_service:
         return "Gmail機能が初期化されていません"
 
     try:
+        # 写真添付が必要な場合は撮影
+        image_path = None
+        if attach_photo:
+            print("写真を撮影中...")
+            image_path = "/tmp/ai_necklace_capture.jpg"
+            result = subprocess.run(
+                ["rpicam-still", "-o", image_path, "-t", "500", "--width", "1280", "--height", "960"],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            if result.returncode != 0:
+                return f"写真の撮影に失敗しました: {result.stderr}"
+
         # 元のメールを取得
         original = gmail_service.users().messages().get(
             userId='me',
@@ -621,12 +735,34 @@ def gmail_reply(message_id, body, to_email=None):
         message_id_header = headers.get('Message-ID', '')
         references = headers.get('References', '')
 
-        message = MIMEText(body)
-        message['to'] = to
-        message['subject'] = subject
-        if message_id_header:
-            message['In-Reply-To'] = message_id_header
-            message['References'] = f"{references} {message_id_header}".strip()
+        # 写真添付の場合はMIMEMultipart、そうでなければMIMEText
+        if attach_photo and image_path:
+            message = MIMEMultipart()
+            message['to'] = to
+            message['subject'] = subject
+            if message_id_header:
+                message['In-Reply-To'] = message_id_header
+                message['References'] = f"{references} {message_id_header}".strip()
+
+            # 本文を追加
+            message.attach(MIMEText(body or "写真を送ります。", 'plain'))
+
+            # 画像を添付
+            with open(image_path, 'rb') as f:
+                img_data = f.read()
+            img_part = MIMEBase('image', 'jpeg')
+            img_part.set_payload(img_data)
+            encoders.encode_base64(img_part)
+            filename = f"photo_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+            img_part.add_header('Content-Disposition', 'attachment', filename=filename)
+            message.attach(img_part)
+        else:
+            message = MIMEText(body)
+            message['to'] = to
+            message['subject'] = subject
+            if message_id_header:
+                message['In-Reply-To'] = message_id_header
+                message['References'] = f"{references} {message_id_header}".strip()
 
         raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
 
@@ -639,8 +775,12 @@ def gmail_reply(message_id, body, to_email=None):
         to_match = re.match(r'(.+?)\s*<', to)
         to_name = to_match.group(1).strip() if to_match else to.split('@')[0]
 
+        if attach_photo:
+            return f"{to_name}さんに写真付きで返信しました"
         return f"{to_name}さんに返信を送信しました"
 
+    except subprocess.TimeoutExpired:
+        return "カメラの撮影がタイムアウトしました"
     except HttpError as e:
         return f"返信エラー: {e}"
 
@@ -676,6 +816,8 @@ def execute_tool(tool_call):
     elif tool_name == 'gmail_reply':
         msg_id = params.get('message_id')
         to_email = None
+        attach_photo = params.get('attach_photo', False)
+        print(f"gmail_reply: params={params}, attach_photo={attach_photo}")  # デバッグログ
         if isinstance(msg_id, int) or (isinstance(msg_id, str) and msg_id.isdigit()):
             idx = int(msg_id) - 1
             print(f"返信処理: idx={idx}, last_email_list長さ={len(last_email_list)}")  # デバッグログ
@@ -685,7 +827,7 @@ def execute_tool(tool_call):
                 print(f"返信先: msg_id={msg_id}, to_email={to_email}")  # デバッグログ
             else:
                 return "指定されたメールが見つかりません。先に「メールを確認して」と言ってください。"
-        return gmail_reply(msg_id, params.get('body'), to_email)
+        return gmail_reply(msg_id, params.get('body'), to_email, attach_photo)
     # アラーム機能
     elif tool_name == 'alarm_set':
         return alarm_set(
@@ -701,6 +843,14 @@ def execute_tool(tool_call):
     elif tool_name == 'camera_capture':
         prompt = params.get('prompt', 'この画像に何が写っていますか？簡潔に説明してください。')
         return camera_describe(prompt)
+    # 写真付きメール送信
+    elif tool_name == 'gmail_send_photo':
+        return gmail_send_photo(
+            to=params.get('to'),
+            subject=params.get('subject', '写真を送ります'),
+            body=params.get('body', ''),
+            take_photo=params.get('take_photo', True)
+        )
     else:
         return f"不明なツール: {tool_name}"
 
@@ -924,18 +1074,52 @@ def get_ai_response(text):
     )
 
     ai_response = response.choices[0].message.content
+    print(f"GPT応答: {ai_response}")  # デバッグログ
 
     # ツール呼び出しかチェック（応答内にJSONが含まれているか）
     try:
         # JSON形式のツール呼び出しを検出（応答の中からJSONを抽出）
         # {"tool": "...", "params": {...}} 形式を探す
-        json_match = re.search(r'\{"tool":\s*"[^"]+",\s*"params":\s*\{[^}]*\}\}', ai_response)
+        # ネストした括弧に対応するため、より柔軟なパターンを使用
+        json_match = re.search(r'\{"tool":\s*"[^"]+",\s*"params":\s*\{[^{}]*\}\}', ai_response)
+        if not json_match:
+            # paramsが空または単純な値の場合
+            json_match = re.search(r'\{"tool":\s*"[^"]+",\s*"params":\s*\{[^}]*\}\}', ai_response)
         if not json_match:
             # シンプルな形式も試す
             json_match = re.search(r'\{[^{}]*"tool"[^{}]*\}', ai_response)
+
+        # マッチした文字列からJSONをパース（失敗したら全体から抽出を試みる）
+        tool_call = None
         if json_match:
             json_str = json_match.group()
-            tool_call = json.loads(json_str)
+            try:
+                tool_call = json.loads(json_str)
+            except json.JSONDecodeError:
+                pass
+
+        # 正規表現でうまくいかない場合、{ から } までを順番に試す
+        if not tool_call and '"tool"' in ai_response:
+            start_idx = ai_response.find('{"tool"')
+            if start_idx == -1:
+                start_idx = ai_response.find('{ "tool"')
+            if start_idx != -1:
+                # 対応する閉じ括弧を探す
+                depth = 0
+                for i, c in enumerate(ai_response[start_idx:]):
+                    if c == '{':
+                        depth += 1
+                    elif c == '}':
+                        depth -= 1
+                        if depth == 0:
+                            json_str = ai_response[start_idx:start_idx + i + 1]
+                            try:
+                                tool_call = json.loads(json_str)
+                                break
+                            except json.JSONDecodeError:
+                                continue
+
+        if tool_call and 'tool' in tool_call:
             print(f"ツール呼び出し: {tool_call}")
 
             # ツール実行
@@ -1107,10 +1291,9 @@ def main():
     print(f"  現在のアラーム: {len(alarms)}件")
 
     print("\nカメラコマンド例:")
-    print("  - 「写真を撮って」")
-    print("  - 「何が見える？」")
-    print("  - 「これは何？」")
-    print("  - 「目の前にあるものを教えて」")
+    print("  - 「写真を撮って」「何が見える？」")
+    print("  - 「さっきの人に写真を送って」")
+    print("  - 「このメールに写真付きで返信して」")
     print("=" * 50)
 
     try:

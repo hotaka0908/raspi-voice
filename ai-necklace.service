@@ -1,7 +1,9 @@
 [Unit]
 Description=AI Necklace Voice Assistant
-After=network.target sound.target
-Wants=sound.target
+After=network-online.target sound.target
+Wants=network-online.target sound.target
+# Wi-Fi接続が確立されるまで待機
+Requires=network-online.target
 
 [Service]
 Type=simple

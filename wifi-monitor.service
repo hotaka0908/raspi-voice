@@ -1,0 +1,18 @@
+[Unit]
+Description=Wi-Fi Connection Monitor and Auto-Reconnect
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/bin/bash /home/hotaka/ai-necklace/wifi_monitor.sh
+Restart=always
+RestartSec=10
+User=root
+
+# ログ出力設定
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
