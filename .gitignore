@@ -22,3 +22,7 @@ Thumbs.db
 # Cloned repo
 voice-ai-agent/
 token.json
+
+# Firebase config (contains API key)
+voice-messenger-web/firebase-config.js
+firebase_voice_config.py

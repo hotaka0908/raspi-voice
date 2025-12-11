@@ -16,14 +16,18 @@ import base64
 from datetime import datetime
 from pathlib import Path
 
-# Firebase設定
-FIREBASE_CONFIG = {
-    "apiKey": "AIzaSyCi1I05bb2Z5es2JJcGfte8cEnWeBtbDVc",
-    "authDomain": "raspi-111.firebaseapp.com",
-    "databaseURL": "https://raspi-111-default-rtdb.asia-southeast1.firebasedatabase.app",
-    "projectId": "raspi-111",
-    "storageBucket": "raspi-111.firebasestorage.app",
-}
+# Firebase設定を外部ファイルから読み込み
+try:
+    from firebase_voice_config import FIREBASE_CONFIG
+except ImportError:
+    # 設定ファイルがない場合のフォールバック
+    FIREBASE_CONFIG = {
+        "apiKey": os.getenv("FIREBASE_API_KEY", ""),
+        "authDomain": os.getenv("FIREBASE_AUTH_DOMAIN", ""),
+        "databaseURL": os.getenv("FIREBASE_DATABASE_URL", ""),
+        "projectId": os.getenv("FIREBASE_PROJECT_ID", ""),
+        "storageBucket": os.getenv("FIREBASE_STORAGE_BUCKET", ""),
+    }
 
 # デバイス識別子
 DEVICE_ID = "raspi"
