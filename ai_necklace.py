@@ -54,6 +54,14 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+# Firebase Voice Messenger
+try:
+    from firebase_voice import FirebaseVoiceMessenger
+    FIREBASE_AVAILABLE = True
+except ImportError:
+    FIREBASE_AVAILABLE = False
+    print("警告: firebase_voiceモジュールが見つかりません。音声メッセージ機能は無効です。")
+
 # GPIOライブラリ
 try:
     from gpiozero import Button
@@ -177,6 +185,16 @@ CONFIG = {
 ユーザーが「写真を撮って○○に送って」などと言ったら、gmail_send_photoで写真を撮影して送信してください。
 ユーザーが「さっきの人に写真を送って」「写真を送って」（宛先なし）と言ったら、gmail_send_photoをtoパラメータなしで呼び出してください。直前にメールをやり取りした相手に送信されます。
 ユーザーが「このメールに写真付きで返信して」「写真を添付して返信」と言ったら、gmail_replyにattach_photo=trueを指定してください。
+
+## 音声メッセージ機能
+
+10. voice_record_send - スマホに音声メッセージを録音して送信
+    - パラメータなし
+
+ユーザーが「スマホにメッセージを送って」「音声メッセージを送って」「スマホに声を送って」と言ったら、必ず以下のJSON形式でツールを呼び出してください:
+{"tool": "voice_record_send", "params": {}}
+
+このツールを呼び出すと、ユーザーの声を録音してスマホに送信します。
 """,
 }
 
@@ -197,12 +215,125 @@ alarm_next_id = 1
 alarm_thread = None
 alarm_file_path = os.path.expanduser("~/.ai-necklace/alarms.json")
 
+# Firebase Voice Messenger
+firebase_messenger = None
+
 
 def signal_handler(sig, frame):
     """Ctrl+C で終了"""
-    global running
+    global running, firebase_messenger
     print("\n終了します...")
     running = False
+    if firebase_messenger:
+        firebase_messenger.stop_listening()
+
+
+# ==================== Firebase Voice Messenger ====================
+
+def init_firebase_messenger():
+    """Firebase Voice Messengerを初期化"""
+    global firebase_messenger
+
+    if not FIREBASE_AVAILABLE:
+        print("Firebase Voice Messenger: 無効（モジュールなし）")
+        return False
+
+    try:
+        firebase_messenger = FirebaseVoiceMessenger(
+            device_id="raspi",
+            on_message_received=on_voice_message_received
+        )
+        firebase_messenger.start_listening(poll_interval=3.0)
+        print("Firebase Voice Messenger: 有効")
+        return True
+    except Exception as e:
+        print(f"Firebase初期化エラー: {e}")
+        return False
+
+
+def on_voice_message_received(message):
+    """スマホからの音声メッセージを受信したときの処理"""
+    global firebase_messenger
+
+    print(f"\n📱 スマホから音声メッセージ受信!")
+
+    try:
+        # 音声データをダウンロード
+        audio_url = message.get("audio_url")
+        if not audio_url:
+            print("音声URLがありません")
+            return
+
+        audio_data = firebase_messenger.download_audio(audio_url)
+        if not audio_data:
+            print("音声ダウンロードに失敗")
+            return
+
+        # WebM形式をWAV形式に変換して再生
+        filename = message.get("filename", "audio.webm")
+        wav_data = convert_webm_to_wav(audio_data, filename)
+        if wav_data:
+            play_audio(wav_data)
+        else:
+            print("音声変換に失敗")
+
+        # 再生済みにマーク
+        firebase_messenger.mark_as_played(message.get("id"))
+
+    except Exception as e:
+        print(f"音声メッセージ処理エラー: {e}")
+
+
+def convert_webm_to_wav(audio_data, filename="audio.webm"):
+    """WebM音声をWAV形式に変換"""
+    try:
+        # 一時ファイルに保存
+        with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as webm_file:
+            webm_file.write(audio_data)
+            webm_path = webm_file.name
+
+        wav_path = webm_path.replace(".webm", ".wav")
+
+        # ffmpegで変換
+        result = subprocess.run([
+            "ffmpeg", "-y", "-i", webm_path,
+            "-ar", "44100", "-ac", "1", "-f", "wav", wav_path
+        ], capture_output=True, timeout=30)
+
+        if result.returncode != 0:
+            print(f"ffmpeg変換エラー: {result.stderr.decode()}")
+            return None
+
+        # WAVデータを読み込み
+        with open(wav_path, "rb") as f:
+            wav_data = f.read()
+
+        # 一時ファイル削除
+        os.unlink(webm_path)
+        os.unlink(wav_path)
+
+        return wav_data
+
+    except Exception as e:
+        print(f"音声変換エラー: {e}")
+        return None
+
+
+def send_voice_to_phone(audio_buffer, text=None):
+    """音声をスマホに送信"""
+    global firebase_messenger
+
+    if not firebase_messenger:
+        print("Firebase未初期化")
+        return False
+
+    try:
+        audio_buffer.seek(0)
+        audio_data = audio_buffer.read()
+        return firebase_messenger.send_message(audio_data, text=text)
+    except Exception as e:
+        print(f"音声送信エラー: {e}")
+        return False
 
 
 # ==================== アラーム機能 ====================
@@ -851,6 +982,11 @@ def execute_tool(tool_call):
             body=params.get('body', ''),
             take_photo=params.get('take_photo', True)
         )
+    # 音声メッセージ録音・送信
+    elif tool_name == 'voice_record_send':
+        if not firebase_messenger:
+            return "音声メッセージ機能が無効です"
+        return "VOICE_RECORD_SEND"  # 特殊な戻り値で録音モードを示す
     else:
         return f"不明なツール: {tool_name}"
 
@@ -1126,6 +1262,10 @@ def get_ai_response(text):
             tool_result = execute_tool(tool_call)
             print(f"ツール結果: {tool_result}")
 
+            # 音声録音・送信の特殊処理
+            if tool_result == "VOICE_RECORD_SEND":
+                return "VOICE_RECORD_SEND"
+
             # ツール結果を含めて再度AIに問い合わせ
             conversation_history.append({"role": "assistant", "content": ai_response})
             conversation_history.append({"role": "user", "content": f"ツール実行結果:\n{tool_result}\n\nこの結果を音声で読み上げるために、簡潔に日本語で要約してください。"})
@@ -1221,8 +1361,54 @@ def process_voice():
     response = get_ai_response(text)
     print(f"[AI] {response}")
 
+    # 音声メッセージ録音・送信モードの処理
+    if response == "VOICE_RECORD_SEND":
+        record_and_send_voice_message()
+        return
+
     speech_audio = text_to_speech(response)
     play_audio(speech_audio)
+
+
+def record_and_send_voice_message():
+    """音声を録音してスマホに送信"""
+    global button, firebase_messenger
+
+    # 録音開始のアナウンス
+    announce = text_to_speech("ピーーという音の後に音声メッセージを送信してください。")
+    play_audio(announce)
+
+    # ビープ音の代わりに短い音声
+    beep = text_to_speech("ピーー")
+    play_audio(beep)
+
+    # 録音
+    print("📢 メッセージを録音中...")
+    if CONFIG["use_button"] and button:
+        # ボタンが押されるまで待機
+        print("ボタンを押して録音を開始してください...")
+        while not button.is_pressed and running:
+            time.sleep(0.05)
+        if not running:
+            return
+        audio_data = record_audio_while_pressed()
+    else:
+        audio_data = record_audio_auto()
+
+    if audio_data is None:
+        print("録音に失敗しました")
+        error_msg = text_to_speech("録音に失敗しました")
+        play_audio(error_msg)
+        return
+
+    # スマホに送信
+    print("📤 スマホに送信中...")
+    if send_voice_to_phone(audio_data):
+        success_msg = text_to_speech("メッセージをスマホに送信しました")
+        play_audio(success_msg)
+    else:
+        error_msg = text_to_speech("送信に失敗しました")
+        play_audio(error_msg)
 
 
 def main():
@@ -1248,6 +1434,9 @@ def main():
     load_alarms()
     start_alarm_thread()
 
+    # Firebase Voice Messenger初期化
+    firebase_available = init_firebase_messenger()
+
     # ボタン初期化
     if CONFIG["use_button"] and GPIO_AVAILABLE:
         try:
@@ -1265,11 +1454,12 @@ def main():
             CONFIG["use_button"] = False
 
     print("=" * 50)
-    print("AI Necklace 起動 (Gmail・アラーム機能付き)")
+    print("AI Necklace 起動 (Gmail・アラーム・音声メッセージ機能付き)")
     print("=" * 50)
     print(f"Chat Model: {CONFIG['chat_model']}")
     print(f"TTS Voice: {CONFIG['tts_voice']}")
     print(f"Gmail: {'有効' if gmail_available else '無効'}")
+    print(f"Voice Messenger: {'有効' if firebase_available else '無効'}")
     if CONFIG["use_button"]:
         print(f"操作方法: GPIO{CONFIG['button_pin']}のボタンを押している間録音")
     else:

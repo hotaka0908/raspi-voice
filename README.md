@@ -14,6 +14,7 @@
 - **カメラ機能**（GPT-4o Visionで画像認識）
 - **写真付きメール送信**（撮影した写真をメールで送信・返信）
 - **Wi-Fi自動切り替え**（家のWi-Fi ↔ iPhoneテザリング）
+- **音声メッセージ機能**（スマホとラズパイ間で双方向の音声メッセージ送受信）
 
 ## ハードウェア
 
@@ -225,6 +226,73 @@ CSIカメラ（IMX500等）を接続すると、GPT-4o Visionによる画像認�
 ```bash
 cat /var/log/wifi_monitor.log
 ```
+
+## 音声メッセージ機能
+
+Firebase を使用して、スマホとラズパイ間で双方向の音声メッセージをやり取りできます。
+
+### 仕組み
+
+```
+ラズパイ ←→ Firebase (Realtime DB + Storage) ←→ スマホ (PWA)
+```
+
+### セットアップ
+
+1. **Firebase プロジェクト作成**
+   - [Firebase Console](https://console.firebase.google.com/) でプロジェクト作成
+   - Realtime Database を有効化
+   - Cloud Storage を有効化
+   - Webアプリを追加して設定情報を取得
+
+2. **セキュリティルール設定**
+
+   Realtime Database ルール:
+   ```json
+   {
+     "rules": {
+       "messages": {
+         ".read": true,
+         ".write": true,
+         ".indexOn": ["timestamp"]
+       }
+     }
+   }
+   ```
+
+   Storage ルール:
+   ```
+   rules_version = '2';
+   service firebase.storage {
+     match /b/{bucket}/o {
+       match /audio/{allPaths=**} {
+         allow read, write: if true;
+       }
+     }
+   }
+   ```
+
+3. **スマホ用Webアプリ**
+
+   `voice-messenger-web/` ディレクトリに PWA が含まれています。
+   Firebase Hosting にデプロイ:
+   ```bash
+   cd voice-messenger-web
+   firebase login
+   firebase deploy --only hosting
+   ```
+
+### 音声コマンド例
+
+**ラズパイ → スマホ:**
+- 「スマホにメッセージを送って」→ 録音開始、ボタンを離すと送信
+
+**スマホ → ラズパイ:**
+- Webアプリで録音ボタンを押して話す → ラズパイで自動再生
+
+### Webアプリ URL
+
+デプロイ後: `https://[プロジェクトID].web.app`
 
 ## ライセンス
 
