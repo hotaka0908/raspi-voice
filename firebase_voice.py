@@ -213,8 +213,8 @@ class FirebaseVoiceMessenger:
 
             while self.running:
                 try:
-                    # 新着メッセージをチェック（未再生のみ）
-                    messages = self.get_messages(limit=10, unplayed_only=True)
+                    # 新着メッセージをチェック（全て取得して自分で判定）
+                    messages = self.get_messages(limit=15, unplayed_only=False)
 
                     for msg in reversed(messages):  # 古い順に処理
                         msg_id = msg.get("id")

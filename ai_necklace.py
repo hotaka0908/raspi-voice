@@ -243,7 +243,7 @@ def init_firebase_messenger():
             device_id="raspi",
             on_message_received=on_voice_message_received
         )
-        firebase_messenger.start_listening(poll_interval=3.0)
+        firebase_messenger.start_listening(poll_interval=1.5)
         print("Firebase Voice Messenger: 有効")
         return True
     except Exception as e:
@@ -1375,12 +1375,8 @@ def record_and_send_voice_message():
     global button, firebase_messenger
 
     # 録音開始のアナウンス
-    announce = text_to_speech("ピーーという音の後に音声メッセージを送信してください。")
+    announce = text_to_speech("了解です。押しながら話してください。")
     play_audio(announce)
-
-    # ビープ音の代わりに短い音声
-    beep = text_to_speech("ピーー")
-    play_audio(beep)
 
     # 録音
     print("📢 メッセージを録音中...")
@@ -1401,9 +1397,21 @@ def record_and_send_voice_message():
         play_audio(error_msg)
         return
 
-    # スマホに送信
+    # 音声をテキストに変換（Whisper API）
+    print("🔤 音声をテキストに変換中...")
+    audio_data.seek(0)  # バッファの先頭に戻す
+    transcribed_text = None
+    try:
+        transcribed_text = transcribe_audio(audio_data)
+        if transcribed_text:
+            print(f"変換されたテキスト: {transcribed_text}")
+    except Exception as e:
+        print(f"テキスト変換エラー: {e}")
+
+    # スマホに送信（テキスト付き）
     print("📤 スマホに送信中...")
-    if send_voice_to_phone(audio_data):
+    audio_data.seek(0)  # バッファの先頭に戻す
+    if send_voice_to_phone(audio_data, text=transcribed_text):
         success_msg = text_to_speech("メッセージをスマホに送信しました")
         play_audio(success_msg)
     else:

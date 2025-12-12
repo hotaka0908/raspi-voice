@@ -230,12 +230,24 @@ cat /var/log/wifi_monitor.log
 ## 音声メッセージ機能
 
 Firebase を使用して、スマホとラズパイ間で双方向の音声メッセージをやり取りできます。
+LINEのようなチャットUIで、音声メッセージを自動的にテキストに変換して表示します。
 
 ### 仕組み
 
 ```
 ラズパイ ←→ Firebase (Realtime DB + Storage) ←→ スマホ (PWA)
 ```
+
+- **ラズパイ → スマホ**: OpenAI Whisper APIで音声をテキスト変換
+- **スマホ → ラズパイ**: Web Speech API（ブラウザ）で音声をテキスト変換
+
+### 機能
+
+- LINEライクなチャットUI（トークリスト → チャット画面）
+- 音声メッセージの自動テキスト変換・表示
+- テキストをタップで音声再生
+- 新着メッセージの通知音
+- 未読バッジ表示
 
 ### セットアップ
 
@@ -272,10 +284,32 @@ Firebase を使用して、スマホとラズパイ間で双方向の音声メ�
    }
    ```
 
-3. **スマホ用Webアプリ**
+3. **設定ファイルの作成**
 
-   `voice-messenger-web/` ディレクトリに PWA が含まれています。
-   Firebase Hosting にデプロイ:
+   ラズパイ用（`firebase_voice_config.py`）:
+   ```python
+   FIREBASE_CONFIG = {
+       "apiKey": "YOUR_API_KEY",
+       "authDomain": "YOUR_PROJECT_ID.firebaseapp.com",
+       "databaseURL": "https://YOUR_PROJECT_ID-default-rtdb.firebasedatabase.app",
+       "projectId": "YOUR_PROJECT_ID",
+       "storageBucket": "YOUR_PROJECT_ID.firebasestorage.app",
+   }
+   ```
+
+   スマホ用（`voice-messenger-web/firebase-config.js`）:
+   ```javascript
+   export default {
+       apiKey: "YOUR_API_KEY",
+       authDomain: "YOUR_PROJECT_ID.firebaseapp.com",
+       databaseURL: "https://YOUR_PROJECT_ID-default-rtdb.firebasedatabase.app",
+       projectId: "YOUR_PROJECT_ID",
+       storageBucket: "YOUR_PROJECT_ID.firebasestorage.app"
+   };
+   ```
+
+4. **スマホ用Webアプリのデプロイ**
+
    ```bash
    cd voice-messenger-web
    firebase login
@@ -285,10 +319,10 @@ Firebase を使用して、スマホとラズパイ間で双方向の音声メ�
 ### 音声コマンド例
 
 **ラズパイ → スマホ:**
-- 「スマホにメッセージを送って」→ 録音開始、ボタンを離すと送信
+- 「スマホにメッセージを送って」→「了解です。押しながら話してください。」→ 録音開始、ボタンを離すと送信
 
 **スマホ → ラズパイ:**
-- Webアプリで録音ボタンを押して話す → ラズパイで自動再生
+- チャット画面で録音ボタンを押しながら話す → ラズパイで自動再生
 
 ### Webアプリ URL
 
