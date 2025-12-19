@@ -44,7 +44,7 @@ import subprocess
 
 import pyaudio
 import numpy as np
-from openai import OpenAI
+from openai import OpenAI, APIConnectionError
 from dotenv import load_dotenv
 
 # Gmail API
@@ -102,8 +102,8 @@ CONFIG = {
     "use_button": True,
 
     # AI設定
-    "whisper_model": "whisper-1",
-    "tts_model": "tts-1",
+    "whisper_model": "gpt-4o-mini-transcribe-2025-12-15",
+    "tts_model": "gpt-4o-mini-tts-2025-12-15",
     "tts_voice": "nova",
     "tts_speed": 1.2,
     "chat_model": "gpt-4o-mini",
@@ -1312,6 +1312,10 @@ def play_audio(audio_data):
     """音声を再生"""
     global audio
 
+    if audio_data is None:
+        print("音声データがありません")
+        return
+
     output_device = CONFIG["output_device_index"]
     if output_device is None:
         output_device = find_audio_device(audio, "output")
@@ -1320,20 +1324,40 @@ def play_audio(audio_data):
 
     wav_buffer = io.BytesIO(audio_data)
     with wave.open(wav_buffer, 'rb') as wf:
+        original_rate = wf.getframerate()
+        channels = wf.getnchannels()
+        sampwidth = wf.getsampwidth()
+        target_rate = 48000
+
+        # 全フレームを読み込み
+        frames = wf.readframes(wf.getnframes())
+
+        # 48000Hz以外の場合はリサンプリング
+        if original_rate != target_rate:
+            # バイトデータをnumpy配列に変換
+            audio_array = np.frombuffer(frames, dtype=np.int16)
+
+            # リサンプリング（線形補間）
+            original_length = len(audio_array)
+            target_length = int(original_length * target_rate / original_rate)
+            indices = np.linspace(0, original_length - 1, target_length)
+            resampled = np.interp(indices, np.arange(original_length), audio_array)
+            frames = resampled.astype(np.int16).tobytes()
+            print(f"リサンプリング: {original_rate}Hz → {target_rate}Hz")
+
         stream = audio.open(
-            format=audio.get_format_from_width(wf.getsampwidth()),
-            channels=wf.getnchannels(),
-            rate=wf.getframerate(),
+            format=audio.get_format_from_width(sampwidth),
+            channels=channels,
+            rate=target_rate,
             output=True,
             output_device_index=output_device
         )
 
-        chunk_size = 1024
-        data = wf.readframes(chunk_size)
-
-        while data and running:
-            stream.write(data)
-            data = wf.readframes(chunk_size)
+        chunk_size = 1024 * sampwidth * channels
+        for i in range(0, len(frames), chunk_size):
+            if not running:
+                break
+            stream.write(frames[i:i+chunk_size])
 
         stream.stop_stream()
         stream.close()
@@ -1351,23 +1375,32 @@ def process_voice():
     if audio_data is None:
         return
 
-    text = transcribe_audio(audio_data)
-    if not text or text.strip() == "":
-        print("テキストが認識できませんでした")
-        return
+    try:
+        text = transcribe_audio(audio_data)
+        if not text or text.strip() == "":
+            print("テキストが認識できませんでした")
+            return
 
-    print(f"\n[あなた] {text}")
+        print(f"\n[あなた] {text}")
 
-    response = get_ai_response(text)
-    print(f"[AI] {response}")
+        response = get_ai_response(text)
+        print(f"[AI] {response}")
 
-    # 音声メッセージ録音・送信モードの処理
-    if response == "VOICE_RECORD_SEND":
-        record_and_send_voice_message()
-        return
+        # 音声メッセージ録音・送信モードの処理
+        if response == "VOICE_RECORD_SEND":
+            record_and_send_voice_message()
+            return
 
-    speech_audio = text_to_speech(response)
-    play_audio(speech_audio)
+        speech_audio = text_to_speech(response)
+        play_audio(speech_audio)
+
+    except APIConnectionError as e:
+        print(f"⚠️ ネットワーク接続エラー: {e}")
+        print("インターネット接続を確認してください。再試行できます。")
+    except Exception as e:
+        print(f"⚠️ 処理エラー: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 def record_and_send_voice_message():
@@ -1498,20 +1531,37 @@ def main():
         if CONFIG["use_button"] and button:
             print("\n--- ボタンを押して話しかけてください ---")
             while running:
-                if button.is_pressed:
-                    process_voice()
-                    if running:
-                        print("\n--- ボタンを押して話しかけてください ---")
-                time.sleep(0.05)
+                try:
+                    if button.is_pressed:
+                        process_voice()
+                        if running:
+                            print("\n--- ボタンを押して話しかけてください ---")
+                    time.sleep(0.05)
+                except Exception as e:
+                    print(f"⚠️ ループ内エラー: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    print("処理を継続します...")
+                    time.sleep(1)
         else:
             while running:
-                print("\n--- 待機中 (話しかけてください) ---")
-                process_voice()
+                try:
+                    print("\n--- 待機中 (話しかけてください) ---")
+                    process_voice()
+                except Exception as e:
+                    print(f"⚠️ ループ内エラー: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    print("処理を継続します...")
+                    time.sleep(1)
 
+    except KeyboardInterrupt:
+        print("\n終了シグナルを受信しました")
     except Exception as e:
-        print(f"エラー: {e}")
+        print(f"致命的エラー: {e}")
         import traceback
         traceback.print_exc()
+        sys.exit(1)
     finally:
         if audio:
             audio.terminate()

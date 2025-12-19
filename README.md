@@ -5,9 +5,9 @@
 ## 機能
 
 - ボタンを押している間だけ録音（トランシーバー方式）
-- OpenAI Whisper APIによる音声認識
+- OpenAI 最新音声モデルによる高精度な音声認識（gpt-4o-mini-transcribe）
 - GPT-4o-miniによるAI応答生成
-- OpenAI TTSによる音声合成
+- OpenAI 最新TTSモデルによる自然な音声合成（gpt-4o-mini-tts）
 - systemdによる自動起動
 - **Gmail連携**（メール確認・返信・送信）
 - **アラーム機能**（時刻指定で音声通知）
@@ -121,6 +121,8 @@ amixer -c 2 set Mic 100%
 |---------|------|-----------|
 | button_pin | ボタンのGPIOピン | 5 |
 | use_button | ボタン操作を使用 | True |
+| whisper_model | 音声認識モデル | gpt-4o-mini-transcribe-2025-12-15 |
+| tts_model | 音声合成モデル | gpt-4o-mini-tts-2025-12-15 |
 | chat_model | 使用するAIモデル | gpt-4o-mini |
 | tts_voice | TTSの声 | nova |
 | tts_speed | 読み上げ速度 | 1.2 |
